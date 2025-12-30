@@ -2,11 +2,9 @@
 
 This is a workflow to automate the conversion of PDFs to markdown using the Mistral AI OCR API. It extracts text and images from PDFs and organizes the output into structured markdown documents with images properly linked using Obsidian-style wikilinks.
 
-> **New!!**: There’s now a web app where you can upload PDFs, preview the output, and download the Markdown files—no setup required. Try it here: https://markdownify.up.railway.app/ (Warning: Servers got busy so might not work, better check the self-host or notebook options).
+The initial version was a [Jupyter Notebook](#option-3-jupyter-notebook). Recently, I vibe-coded a [Local Web App](#option-1-self-hosted-local-web-app) where you can do the same in a more visual and understandable way, might have some defects and problems, feel free to improve it or host it online for others.
 
-Want to self-host it? Check the [Local Web App](#option-2-local-web-app) section.
-
-Prefer working in a python notebook? There's also a Jupyter Notebook version—the original version of this project. See the [Jupyter Notebook](#option-3-jupyter-notebook) section for more details.
+You can also find useful the [OCR Extractor Plugin for Obsidian](https://obsidian.md/plugins?id=ocr-extractor), made by jritzi ([GitHub](https://github.com/jritzi/ocr-extractor)). Which uses the same Mistral OCR technology.
 
 ## Features
 
@@ -17,20 +15,14 @@ Prefer working in a python notebook? There's also a Jupyter Notebook version—t
 - **OCR caching:** Saves the OCR response as JSON to avoid redundant API calls.
 - **Notebook mode:** Running step-by-step OCR processing in a Jupyter Notebook.
 
-Contributions to improve compatibility with different Obsidian setups are welcome!
+Contributions to improve compatibility and robustness are welcome!
 
-## Option 1: Hosted Web App
-
-https://markdownify.up.railway.app/
-
-**Usage:**
+## Self-hosted Local Web App
 
 ![alt text](doc/usage.gif)
 
-## Option 2: Local Web App
-
 ```sh
-pip install -r requirements.txt
+pip install -r requirements.txt    # (I recommend creating a virtual environment to not clutter your OS)
 python app.py
 ```
 Then open your browser at `http://localhost:5000/`
@@ -41,7 +33,7 @@ The app inserts `---` between PDF pages by default. Set the `PAGE_SEPARATOR` env
 variable to change this text or leave it empty to merge pages without separators.
 The web interface also lets you toggle and edit the separator before processing.
 
-## Option 3: Jupyter Notebook
+## Jupyter Notebook
 
 ### Installation
 
@@ -103,10 +95,10 @@ Move the generated `output.md` file into your **Obsidian vault** and also move t
 **Heads up!**: For now, Obsidian must be configured to support ![[image-name]] style links. If your setup is different, the script might not work as-is. Feel free to fork and tweak it.
 
 ### How It Works
+
 1. The notebook scans `pdfs_to_process` for PDFs.
 2. Each PDF is uploaded to Mistral AI for OCR processing.
 3. The text is extracted and saved as markdown (`output.md`).
 4. Images are extracted, saved in a subfolder, and referenced in the markdown using `![[image-name]]`.
 5. The original PDF is moved to `pdfs-done` to avoid duplicate processing.
 6. The full OCR response is saved as JSON for later use.
-
