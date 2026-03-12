@@ -107,6 +107,16 @@
     background-color: #ccd0d5;
     cursor: not-allowed;
   }
+
+  .btn-secondary {
+    background-color: #6c757d;
+    padding: 6px 14px;
+    font-size: 0.9em;
+  }
+
+  .btn-secondary:hover {
+    background-color: #545b62;
+  }
   
   small {
     display: block;

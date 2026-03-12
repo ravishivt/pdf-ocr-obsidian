@@ -4,6 +4,9 @@ pdf-ocr-markdown/
 pdfs_to_process/
 pdfs-done/
 
+# Python virtual environment
+venv/
+
 # Python cache
 __pycache__/
 *.pyc

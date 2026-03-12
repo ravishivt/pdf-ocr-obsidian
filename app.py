@@ -9,19 +9,11 @@ from uuid import uuid4
 from flask import Flask, request, render_template, jsonify, send_from_directory, url_for
 from mistralai import Mistral, DocumentURLChunk
 from mistralai.models import OCRResponse
+import fitz  # PyMuPDF
 from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 load_dotenv()
-
-print("--- .env Loading Debug ---")
-dotenv_api_key = os.getenv("MISTRAL_API_KEY")
-if dotenv_api_key:
-    print(f"API Key loaded from .env (first 4 chars): {dotenv_api_key[:4]}...")
-else:
-    print("API Key NOT loaded from .env. Check .env file and setup.")
-print("--- End .env Debug ---")
-
 
 app = Flask(__name__)
 
@@ -49,22 +41,49 @@ def replace_images_in_markdown_with_wikilinks(markdown_str: str, image_mapping: 
         )
     return updated_markdown
 
+def extract_images_pymupdf(pdf_path: Path, images_dir: Path, pdf_base_sanitized: str) -> dict[int, list[str]]:
+    """
+    Extract all embedded images from the PDF using PyMuPDF.
+    Returns dict mapping 1-based page number -> list of image filenames saved to images_dir.
+    """
+    images_by_page: dict[int, list[str]] = {}
+
+    doc = fitz.open(str(pdf_path))
+    for page_index in range(len(doc)):
+        page_num = page_index + 1
+        image_list = doc.get_page_images(page_index, full=True)
+        for img_index, img_info in enumerate(image_list):
+            xref = img_info[0]
+            try:
+                base_image = doc.extract_image(xref)
+            except Exception as e:
+                print(f"  Warning: could not extract image xref {xref} on page {page_num}: {e}")
+                continue
+
+            img_bytes = base_image["image"]
+            ext = "." + base_image["ext"]
+            dest_name = f"{pdf_base_sanitized}_pymupdf_p{page_num}_{img_index:03d}{ext}"
+            dest_path = images_dir / dest_name
+            try:
+                dest_path.write_bytes(img_bytes)
+                images_by_page.setdefault(page_num, []).append(dest_name)
+            except OSError as e:
+                print(f"  Warning: could not write image {dest_path}: {e}")
+
+    doc.close()
+    total = sum(len(v) for v in images_by_page.values())
+    print(f"  PyMuPDF extracted {total} images across {len(images_by_page)} pages.")
+    return images_by_page
+
+
 # --- Core Processing Logic ---
 
 def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_separator: str | None = PAGE_SEPARATOR_DEFAULT) -> tuple[str, str, list[str], Path, Path]:
     """
-    Processes a single PDF file using Mistral OCR and saves results.
-
-    Args:
-        pdf_path: Path to the PDF file.
-        api_key: Mistral API key.
-        session_output_dir: Directory to store output.
-        page_separator: Text to insert between pages. Use empty string to join pages without a separator.
+    Processes a single PDF file using Mistral OCR and PyMuPDF, saves results.
 
     Returns:
         A tuple (pdf_base_name, final_markdown_content, list_of_image_filenames, path_to_markdown_file, path_to_images_dir)
-    Raises:
-        Exception: For processing errors.
     """
     pdf_base = pdf_path.stem
     base_sanitized_original = secure_filename(pdf_base)
@@ -84,7 +103,7 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
 
     client = Mistral(api_key=api_key)
     ocr_response: OCRResponse | None = None
-    uploaded_file = None # Initialize uploaded_file
+    uploaded_file = None
 
     try:
         print(f"  Uploading {pdf_path.name} to Mistral...")
@@ -112,50 +131,78 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
                 if hasattr(ocr_response, 'model_dump'):
                     json.dump(ocr_response.model_dump(), json_file, indent=4, ensure_ascii=False)
                 else:
-                     json.dump(ocr_response.dict(), json_file, indent=4, ensure_ascii=False)
+                    json.dump(ocr_response.dict(), json_file, indent=4, ensure_ascii=False)
             print(f"  Raw OCR response saved to {ocr_json_path}")
         except Exception as json_err:
             print(f"  Warning: Could not save raw OCR JSON: {json_err}")
 
-        # Process OCR Response -> Markdown & Images
+        # --- Extract all images via PyMuPDF for supplemental coverage ---
+        print(f"  Extracting images via PyMuPDF...")
+        pdfimages_by_page = extract_images_pymupdf(pdf_path, images_dir, pdf_base_sanitized)
+
+        # --- Process OCR Response -> Markdown & Images ---
         global_image_counter = 1
         updated_markdown_pages = []
-        extracted_image_filenames = [] # Store filenames for preview
+        extracted_image_filenames = []
+        mistral_count_by_page: dict[int, int] = {}  # 1-based page -> count of Mistral images
 
-        print(f"  Extracting images and generating Markdown...")
+        print(f"  Extracting Mistral OCR images and generating Markdown...")
         for page_index, page in enumerate(ocr_response.pages):
             current_page_markdown = page.markdown
             page_image_mapping = {}
+            page_num = page_index + 1
 
             for image_obj in page.images:
                 base64_str = image_obj.image_base64
-                if not base64_str: continue # Skip if no image data
+                if not base64_str:
+                    continue
 
                 if base64_str.startswith("data:"):
-                     try: base64_str = base64_str.split(",", 1)[1]
-                     except IndexError: continue
+                    try:
+                        base64_str = base64_str.split(",", 1)[1]
+                    except IndexError:
+                        continue
 
-                try: image_bytes = base64.b64decode(base64_str)
+                try:
+                    image_bytes = base64.b64decode(base64_str)
                 except Exception as decode_err:
-                    print(f"  Warning: Base64 decode error for image {image_obj.id} on page {page_index+1}: {decode_err}")
+                    print(f"  Warning: Base64 decode error for image {image_obj.id} on page {page_num}: {decode_err}")
                     continue
 
                 original_ext = Path(image_obj.id).suffix
                 ext = original_ext if original_ext else ".png"
-                new_image_name = f"{pdf_base_sanitized}_p{page_index+1}_img{global_image_counter}{ext}"
+                new_image_name = f"{pdf_base_sanitized}_p{page_num}_img{global_image_counter}{ext}"
                 global_image_counter += 1
 
                 image_output_path = images_dir / new_image_name
                 try:
                     with open(image_output_path, "wb") as img_file:
                         img_file.write(image_bytes)
-                    extracted_image_filenames.append(new_image_name) # Add to list for preview
+                    extracted_image_filenames.append(new_image_name)
                     page_image_mapping[image_obj.id] = new_image_name
                 except IOError as io_err:
-                     print(f"  Warning: Could not write image file {image_output_path}: {io_err}")
-                     continue
+                    print(f"  Warning: Could not write image file {image_output_path}: {io_err}")
+                    continue
 
+            mistral_count_by_page[page_num] = len(page_image_mapping)
             updated_page_markdown = replace_images_in_markdown_with_wikilinks(current_page_markdown, page_image_mapping)
+
+            # --- Append supplemental PyMuPDF images for this page ---
+            pdfimg_files = pdfimages_by_page.get(page_num, [])
+            mistral_count = mistral_count_by_page[page_num]
+            extra_pdfimg = pdfimg_files[mistral_count:]  # Images beyond what Mistral found
+
+            if extra_pdfimg:
+                img_refs = "\n".join(f"![[{name}]]" for name in extra_pdfimg)
+                supplement = (
+                    f"\n\n> [!note] Supplemental Images — Page {page_num}\n"
+                    f"> The following images were found by raw extraction but not placed inline by OCR.\n\n"
+                    f"{img_refs}"
+                )
+                updated_page_markdown = updated_page_markdown + supplement
+                extracted_image_filenames.extend(extra_pdfimg)
+                print(f"  Page {page_num}: added {len(extra_pdfimg)} supplemental image(s) from PyMuPDF.")
+
             updated_markdown_pages.append(updated_page_markdown)
 
         separator = f"\n\n{page_separator}\n\n" if page_separator else "\n\n"
@@ -173,15 +220,13 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
         try:
             client.files.delete(file_id=uploaded_file.id)
             print(f"  Deleted temporary file {uploaded_file.id} from Mistral.")
-        except Exception as delete_err: # Catch general Exception
+        except Exception as delete_err:
             print(f"  Warning: Could not delete file {uploaded_file.id} from Mistral: {delete_err}")
 
-        # Return the actual content and image list now
         return pdf_base_sanitized, final_markdown_content, extracted_image_filenames, output_markdown_path, images_dir
 
     except Exception as e:
         error_str = str(e)
-        # Attempt to extract JSON error message from the exception string
         json_index = error_str.find('{')
         if json_index != -1:
             try:
@@ -192,10 +237,11 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
         else:
             error_msg = error_str
         print(f"  Error processing {pdf_path.name}: {error_msg}")
-        # Attempt cleanup even on error
         if uploaded_file:
-            try: client.files.delete(file_id=uploaded_file.id)
-            except Exception: pass
+            try:
+                client.files.delete(file_id=uploaded_file.id)
+            except Exception:
+                pass
         raise Exception(error_msg)
 
 
@@ -205,8 +251,6 @@ def create_zip_archive(source_dir: Path, output_zip_path: Path):
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for entry in source_dir.rglob('*'):
                 arcname = entry.relative_to(source_dir)
-                # Ensure arcname contains the 'images' folder if it exists
-                # Example: arcname should be 'images/my_image.png', not just 'my_image.png'
                 zipf.write(entry, arcname)
         print(f"  Successfully created ZIP: {output_zip_path}")
     except Exception as e:
@@ -222,9 +266,28 @@ def index():
 
 @app.route('/check-api-key', methods=['GET'])
 def check_api_key():
-    """check if the API key is configured in the environment variables"""
+    """Check if the API key is configured in the environment variables."""
     api_key = os.getenv("MISTRAL_API_KEY")
     return jsonify({"has_api_key": bool(api_key)})
+
+@app.route('/save-api-key', methods=['POST'])
+def save_api_key():
+    """Save the provided API key to the local .env file (gitignored)."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    key = data.get('api_key', '').strip()
+    if not key:
+        return jsonify({"error": "No API key provided"}), 400
+
+    env_file = Path('.env')
+    if not env_file.exists():
+        env_file.write_text('')
+
+    set_key(str(env_file), 'MISTRAL_API_KEY', key)
+    load_dotenv(override=True)
+    print("API key saved to .env and reloaded.")
+    return jsonify({"success": True})
 
 @app.route('/process', methods=['POST'])
 def handle_process():
@@ -232,33 +295,33 @@ def handle_process():
         return jsonify({"error": "No PDF files part in the request"}), 400
 
     files = request.files.getlist('pdf_files')
-    
-    # use the API key from the environment variables first
+
+    # Use the API key from environment first, then fall back to form input
     api_key = os.getenv("MISTRAL_API_KEY")
     if api_key:
         print(f"Using API Key from environment (first 4 chars): {api_key[:4]}...")
     else:
-        # if the API key is not in the environment variables, get it from the form
         api_key = request.form.get('api_key')
         if api_key:
             print(f"Using API Key from web form (first 4 chars): {api_key[:4]}...")
         else:
-            return jsonify({"error": "Mistral API Key is required. Please set MISTRAL_API_KEY in environment or provide it in the form."}), 400
+            return jsonify({"error": "Mistral API Key is required. Set MISTRAL_API_KEY in .env or provide it in the form."}), 400
 
     if not files or all(f.filename == '' for f in files):
-         return jsonify({"error": "No selected PDF files"}), 400
+        return jsonify({"error": "No selected PDF files"}), 400
 
     valid_files, invalid_files = [], []
     for f in files:
-        if f and allowed_file(f.filename): valid_files.append(f)
-        elif f and f.filename != '': invalid_files.append(f.filename)
+        if f and allowed_file(f.filename):
+            valid_files.append(f)
+        elif f and f.filename != '':
+            invalid_files.append(f.filename)
 
     if not valid_files:
-         # ... (error handling as before) ...
-         error_msg = "No valid PDF files found."
-         if invalid_files: error_msg += f" Invalid files skipped: {', '.join(invalid_files)}"
-         return jsonify({"error": error_msg}), 400
-
+        error_msg = "No valid PDF files found."
+        if invalid_files:
+            error_msg += f" Invalid files skipped: {', '.join(invalid_files)}"
+        return jsonify({"error": error_msg}), 400
 
     session_id = str(uuid4())
     session_upload_dir = UPLOAD_FOLDER / session_id
@@ -266,9 +329,10 @@ def handle_process():
     session_upload_dir.mkdir(parents=True, exist_ok=True)
     session_output_dir.mkdir(parents=True, exist_ok=True)
 
-    processed_files_results = [] # Changed name for clarity
+    processed_files_results = []
     processing_errors = []
-    if invalid_files: processing_errors.append(f"Skipped non-PDF files: {', '.join(invalid_files)}")
+    if invalid_files:
+        processing_errors.append(f"Skipped non-PDF files: {', '.join(invalid_files)}")
 
     page_separator = request.form.get('page_separator')
     if page_separator is None:
@@ -279,12 +343,10 @@ def handle_process():
         filename_sanitized = secure_filename(original_filename)
         temp_pdf_path = session_upload_dir / filename_sanitized
 
-
         try:
             print(f"Saving uploaded file temporarily to: {temp_pdf_path}")
             file.save(temp_pdf_path)
 
-            # Process PDF - Capture new return values
             processed_pdf_base, markdown_content, image_filenames, md_path, img_dir = process_pdf(
                 temp_pdf_path, api_key, session_output_dir, page_separator
             )
@@ -296,15 +358,14 @@ def handle_process():
 
             download_url = url_for('download_file', session_id=session_id, filename=zip_filename, _external=True)
 
-            # Store results including preview data
             processed_files_results.append({
-                "original_filename": original_filename, # Keep original name for display
+                "original_filename": original_filename,
                 "zip_filename": zip_filename,
                 "download_url": download_url,
                 "preview": {
                     "markdown": markdown_content,
                     "images": image_filenames,
-                    "pdf_base": processed_pdf_base # Use the sanitized base name returned by process_pdf
+                    "pdf_base": processed_pdf_base
                 }
             })
             print(f"Successfully processed and zipped: {original_filename}")
@@ -314,10 +375,11 @@ def handle_process():
             processing_errors.append(f"{original_filename}: Processing Error - {e}")
         finally:
             if temp_pdf_path.exists():
-                try: temp_pdf_path.unlink()
-                except OSError as unlink_err: print(f"Warning: Could not delete temp file {temp_pdf_path}: {unlink_err}")
+                try:
+                    temp_pdf_path.unlink()
+                except OSError as unlink_err:
+                    print(f"Warning: Could not delete temp file {temp_pdf_path}: {unlink_err}")
 
-    # Cleanup session upload dir
     try:
         shutil.rmtree(session_upload_dir)
         print(f"Cleaned up session upload directory: {session_upload_dir}")
@@ -325,19 +387,18 @@ def handle_process():
         print(f"Warning: Could not delete session upload directory {session_upload_dir}: {rmtree_err}")
 
     if not processed_files_results and processing_errors:
-         return jsonify({"error": "All PDF processing attempts failed.", "details": processing_errors}), 500
+        return jsonify({"error": "All PDF processing attempts failed.", "details": processing_errors}), 500
     elif not processed_files_results:
-         return jsonify({"error": "No files were processed successfully."}), 500
+        return jsonify({"error": "No files were processed successfully."}), 500
     else:
-        # Return session_id along with results for constructing image URLs on frontend
         return jsonify({
             "success": True,
-            "session_id": session_id, # ADDED session_id here
-            "results": processed_files_results, # Renamed from 'downloads'
+            "session_id": session_id,
+            "results": processed_files_results,
             "errors": processing_errors
         }), 200
 
-# --- NEW ROUTE for serving images ---
+
 @app.route('/view_image/<session_id>/<pdf_base>/<filename>')
 def view_image(session_id, pdf_base, filename):
     """Serves an extracted image file for inline display."""
@@ -345,18 +406,15 @@ def view_image(session_id, pdf_base, filename):
     safe_pdf_base = secure_filename(pdf_base)
     safe_filename = secure_filename(filename)
 
-    # Construct path relative to the *pdf_base* specific output folder
     directory = OUTPUT_FOLDER / safe_session_id / safe_pdf_base / "images"
     file_path = directory / safe_filename
 
-    # Security check
     if not str(file_path.resolve()).startswith(str(directory.resolve())):
-         return "Invalid path", 400
+        return "Invalid path", 400
     if not file_path.is_file():
-         return "Image not found", 404
+        return "Image not found", 404
 
     print(f"Serving image: {file_path}")
-    # Send *without* as_attachment=True for inline display
     return send_from_directory(directory, safe_filename)
 
 
@@ -368,14 +426,18 @@ def download_file(session_id, filename):
     directory = OUTPUT_FOLDER / safe_session_id
     file_path = directory / safe_filename
 
-    if not str(file_path.resolve()).startswith(str(directory.resolve())): return "Invalid path", 400
-    if not file_path.is_file(): return "File not found", 404
+    if not str(file_path.resolve()).startswith(str(directory.resolve())):
+        return "Invalid path", 400
+    if not file_path.is_file():
+        return "File not found", 404
 
     print(f"Serving ZIP for download: {file_path}")
     return send_from_directory(directory, safe_filename, as_attachment=True)
+
 
 if __name__ == '__main__':
     host = os.getenv('FLASK_HOST', '0.0.0.0')
     port = int(os.getenv('FLASK_PORT', 5200))
     debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() in ['true', '1', 't']
+
     app.run(host=host, port=port, debug=debug_mode)

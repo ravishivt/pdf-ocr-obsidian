@@ -51,6 +51,45 @@ document.addEventListener('DOMContentLoaded', () => {
     // Check API key on page load
     checkApiKey();
 
+    // Save API key to .env
+    const saveApiKeyBtn = document.getElementById('save-api-key-btn');
+    const saveApiKeyStatus = document.getElementById('save-api-key-status');
+    if (saveApiKeyBtn) {
+        saveApiKeyBtn.addEventListener('click', async () => {
+            const key = apiKeyInput.value.trim();
+            if (!key) {
+                saveApiKeyStatus.textContent = 'Enter a key first.';
+                saveApiKeyStatus.style.color = 'red';
+                return;
+            }
+            saveApiKeyBtn.disabled = true;
+            saveApiKeyStatus.textContent = 'Saving...';
+            saveApiKeyStatus.style.color = '';
+            try {
+                const resp = await fetch('/save-api-key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    saveApiKeyStatus.textContent = 'Saved! Key will be loaded automatically on next startup.';
+                    saveApiKeyStatus.style.color = 'green';
+                    // Re-check so the UI reflects the new env key
+                    checkApiKey();
+                } else {
+                    saveApiKeyStatus.textContent = data.error || 'Failed to save.';
+                    saveApiKeyStatus.style.color = 'red';
+                }
+            } catch (e) {
+                saveApiKeyStatus.textContent = 'Error saving key.';
+                saveApiKeyStatus.style.color = 'red';
+            } finally {
+                saveApiKeyBtn.disabled = false;
+            }
+        });
+    }
+
     if (includeSeparatorCheckbox && separatorTextInput) {
         separatorTextInput.disabled = !includeSeparatorCheckbox.checked;
         includeSeparatorCheckbox.addEventListener('change', () => {

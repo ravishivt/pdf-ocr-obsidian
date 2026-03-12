@@ -35,8 +35,12 @@
               <input type="checkbox" id="api-key-toggle">
               <label for="api-key-toggle" class="toggle-label">Show</label>
             </div>
+            <div style="margin-top: 6px;">
+              <button type="button" id="save-api-key-btn" class="btn-secondary">Save key to .env</button>
+              <small id="save-api-key-status" style="margin-left: 8px;"></small>
+            </div>
             <small>Get one at: <a href="https://console.mistral.ai/api-keys" target="_blank">Mistral API</a></small>
-            <small>Your key is securely transmitted and not stored long-term.</small>
+            <small>Saving stores the key in a local <code>.env</code> file (not committed to git).</small>
           </div>
           
           <div class="form-group" id="api-key-configured" style="display: none;">
