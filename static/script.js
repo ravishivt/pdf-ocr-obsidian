@@ -150,10 +150,10 @@ document.addEventListener('DOMContentLoaded', () => {
         let markdownForDisplay = resultItem.preview.markdown;
 
         markdownForDisplay = markdownForDisplay.replace(
-            /!\[\[(.*?)\]\]/g,
-            (match, filename) => {
+            /!\[([^\]]*)\]\(images\/([^)]+)\)/g,
+            (match, altText, filename) => {
                 const imageUrl = `/view_image/${sessionId}/${resultItem.preview.pdf_base}/${filename.trim()}`;
-                const safeAltText = filename.trim().replace(/"/g, '"');
+                const safeAltText = (altText.trim() || filename.trim()).replace(/"/g, '&quot;');
                 return `<img src="${imageUrl}" alt="${safeAltText}" style="max-width: 90%; height: auto; display: block; margin: 10px 0; border: 1px solid #ccc;">`;
             }
         );
