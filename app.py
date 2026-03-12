@@ -1,8 +1,11 @@
 import os
+import io
 import json
 import base64
 import hashlib
 import shutil
+import subprocess
+import tempfile
 import zipfile
 import re
 from pathlib import Path
@@ -10,7 +13,7 @@ from uuid import uuid4
 from flask import Flask, request, render_template, jsonify, send_from_directory, url_for
 from mistralai import Mistral, DocumentURLChunk
 from mistralai.models import OCRResponse
-import fitz  # PyMuPDF
+from PIL import Image, ImageStat
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv, set_key
 
@@ -48,23 +51,16 @@ def replace_images_in_markdown(markdown_str: str, image_mapping: dict) -> str:
 def is_blank_image(img_bytes: bytes) -> bool:
     """Return True if the image contains only whitespace (near-uniform color, no real content)."""
     try:
-        pix = fitz.Pixmap(img_bytes)
-        if pix.alpha:
-            pix = fitz.Pixmap(pix, 0)  # drop alpha channel
-        if pix.n != 1:
-            pix = fitz.Pixmap(fitz.csGRAY, pix)  # convert to grayscale
-        samples = pix.samples
-        if not samples:
-            return True
-        # If the pixel value range is tiny, the image is effectively uniform (blank)
-        return (max(samples) - min(samples)) < 15
+        img = Image.open(io.BytesIO(img_bytes)).convert('L')
+        stat = ImageStat.Stat(img)
+        return stat.stddev[0] < 5
     except Exception:
         return False
 
 
-def extract_images_pymupdf(pdf_path: Path, images_dir: Path, pdf_base_sanitized: str) -> dict:
+def extract_images_pdfimages(pdf_path: Path, images_dir: Path, pdf_base_sanitized: str) -> dict:
     """
-    Extract embedded images from a PDF using PyMuPDF.
+    Extract embedded images from a PDF using pdfimages (poppler).
 
     Filtering applied:
     - Skips blank/whitespace images (near-uniform pixel values)
@@ -72,63 +68,75 @@ def extract_images_pymupdf(pdf_path: Path, images_dir: Path, pdf_base_sanitized:
       (catches repeated headers/footers/watermarks that appear throughout the document)
     - Deduplicates: identical image content is saved only on its first occurrence
 
-    Naming: {pdf_base}_p{page}_img{n}.{ext}, where n is 1-based per page.
+    Naming: {pdf_base}_p{page}_img{n}.png, where n is 1-based per page.
 
     Returns:
         dict mapping 1-based page number -> list of saved image filenames
     """
-    doc = fitz.open(str(pdf_path))
+    # Get page count via pdfinfo (also part of poppler)
+    try:
+        info_result = subprocess.run(
+            ['pdfinfo', str(pdf_path)], capture_output=True, text=True, check=True
+        )
+        pages_match = re.search(r'Pages:\s+(\d+)', info_result.stdout)
+        page_count = int(pages_match.group(1)) if pages_match else 0
+    except FileNotFoundError:
+        raise RuntimeError(
+            "pdfinfo not found. Install poppler:\n"
+            "  macOS: brew install poppler\n"
+            "  Ubuntu/Debian: sudo apt-get install poppler-utils"
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"pdfinfo failed: {e.stderr}")
 
-    # Pass 1: collect raw image data and track which pages each hash appears on
-    raw_by_page: dict[int, list[tuple]] = {}   # page_num -> [(img_bytes, ext, hash), ...]
-    hash_page_count: dict[str, set] = {}        # hash -> set of page_nums it appears on
+    if page_count == 0:
+        print(f"  pdfimages: could not determine page count for {pdf_path.name}")
+        return {}
 
-    for page_index in range(len(doc)):
-        page_num = page_index + 1
-        for img_info in doc.get_page_images(page_index, full=True):
-            xref = img_info[0]
-            try:
-                base_image = doc.extract_image(xref)
-            except Exception as e:
-                print(f"  Warning: could not extract image xref {xref} on page {page_num}: {e}")
-                continue
+    # Pass 1: extract images page by page, collect raw data + page-presence counts
+    hash_page_count: dict[str, set] = {}
+    raw: list[tuple] = []  # (page_num, img_bytes, content_hash)
 
-            img_bytes = base_image["image"]
-            if is_blank_image(img_bytes):
-                continue
-
-            content_hash = hashlib.md5(img_bytes).hexdigest()
-            hash_page_count.setdefault(content_hash, set()).add(page_num)
-            raw_by_page.setdefault(page_num, []).append((img_bytes, base_image["ext"], content_hash))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        for page_num in range(1, page_count + 1):
+            prefix = str(tmp_path / 'img')
+            subprocess.run(
+                ['pdfimages', '-png', '-f', str(page_num), '-l', str(page_num), str(pdf_path), prefix],
+                capture_output=True
+            )
+            for img_file in sorted(tmp_path.glob('img-*.png')):
+                img_bytes = img_file.read_bytes()
+                img_file.unlink()
+                if is_blank_image(img_bytes):
+                    continue
+                content_hash = hashlib.md5(img_bytes).hexdigest()
+                hash_page_count.setdefault(content_hash, set()).add(page_num)
+                raw.append((page_num, img_bytes, content_hash))
 
     # Pass 2: save images — skip repeated elements and exact duplicates
     images_by_page: dict[int, list[str]] = {}
     seen_hashes: set[str] = set()
+    page_counters: dict[int, int] = {}
 
-    for page_num in sorted(raw_by_page.keys()):
-        local_idx = 1
-        page_files = []
-        for img_bytes, ext, content_hash in raw_by_page[page_num]:
-            if len(hash_page_count[content_hash]) >= REPEATED_PAGE_THRESHOLD:
-                continue  # Appears too many times — likely a header/footer/watermark
-            if content_hash in seen_hashes:
-                continue  # Exact duplicate already saved
-            seen_hashes.add(content_hash)
+    for page_num, img_bytes, content_hash in raw:
+        if len(hash_page_count[content_hash]) >= REPEATED_PAGE_THRESHOLD:
+            continue  # Appears too many times — likely a header/footer/watermark
+        if content_hash in seen_hashes:
+            continue  # Exact duplicate already saved
+        seen_hashes.add(content_hash)
 
-            filename = f"{pdf_base_sanitized}_p{page_num}_img{local_idx}.{ext}"
-            try:
-                (images_dir / filename).write_bytes(img_bytes)
-                page_files.append(filename)
-                local_idx += 1
-            except OSError as e:
-                print(f"  Warning: could not write image {filename}: {e}")
+        local_idx = page_counters.get(page_num, 0) + 1
+        page_counters[page_num] = local_idx
+        filename = f"{pdf_base_sanitized}_p{page_num}_img{local_idx}.png"
+        try:
+            (images_dir / filename).write_bytes(img_bytes)
+            images_by_page.setdefault(page_num, []).append(filename)
+        except OSError as e:
+            print(f"  Warning: could not write image {filename}: {e}")
 
-        if page_files:
-            images_by_page[page_num] = page_files
-
-    doc.close()
     total = sum(len(v) for v in images_by_page.values())
-    print(f"  PyMuPDF: saved {total} images across {len(images_by_page)} pages (after filtering/dedup).")
+    print(f"  pdfimages: saved {total} images across {len(images_by_page)} pages (after filtering/dedup).")
     return images_by_page
 
 
@@ -136,14 +144,14 @@ def extract_images_pymupdf(pdf_path: Path, images_dir: Path, pdf_base_sanitized:
 
 def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_separator: str | None = PAGE_SEPARATOR_DEFAULT) -> tuple[str, str, list[str], Path, Path]:
     """
-    Processes a single PDF file using Mistral OCR and PyMuPDF, saves results.
+    Processes a single PDF file using Mistral OCR and pdfimages (poppler), saves results.
 
     Strategy:
-    - PyMuPDF is the primary image source (full resolution, filtered, deduplicated).
+    - pdfimages (poppler) is the primary image source (full resolution, filtered, deduplicated).
     - Mistral OCR determines WHERE each image appears inline in the markdown.
-    - Mistral images are matched positionally to PyMuPDF images per page.
-    - Extra PyMuPDF images (not matched by Mistral) are appended near the page boundary.
-    - If Mistral finds more images than PyMuPDF, the Mistral version is used as a fallback
+    - pdfimages images are matched positionally to Mistral image placeholders per page.
+    - Extra pdfimages images (not matched by Mistral) are appended near the page boundary.
+    - If Mistral finds more images than pdfimages, the Mistral version is used as a fallback
       and a warning is logged (indicating a potential extraction gap).
 
     Returns:
@@ -199,26 +207,26 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
         except Exception as json_err:
             print(f"  Warning: Could not save raw OCR JSON: {json_err}")
 
-        # --- Extract images via PyMuPDF (primary, full-resolution) ---
-        print(f"  Extracting images via PyMuPDF...")
-        pymupdf_by_page = extract_images_pymupdf(pdf_path, images_dir, pdf_base_sanitized)
+        # --- Extract images via pdfimages/poppler (primary, full-resolution) ---
+        print(f"  Extracting images via pdfimages...")
+        pdfimages_by_page = extract_images_pdfimages(pdf_path, images_dir, pdf_base_sanitized)
 
-        # Start the filenames list from all PyMuPDF-saved images
-        extracted_image_filenames = [f for imgs in pymupdf_by_page.values() for f in imgs]
+        # Start the filenames list from all pdfimages-extracted images
+        extracted_image_filenames = [f for imgs in pdfimages_by_page.values() for f in imgs]
 
         # --- Process OCR response: build markdown with merged image references ---
         updated_markdown_pages = []
-        print(f"  Merging OCR output with PyMuPDF images...")
+        print(f"  Merging OCR output with pdfimages results...")
 
         for page_index, page in enumerate(ocr_response.pages):
             page_num = page_index + 1
             current_page_markdown = page.markdown
             page_image_mapping = {}
 
-            pymupdf_page_imgs = list(pymupdf_by_page.get(page_num, []))
-            pymupdf_iter = iter(pymupdf_page_imgs)
-            # Fallback naming continues after PyMuPDF images on this page
-            fallback_n = len(pymupdf_page_imgs)
+            page_imgs = list(pdfimages_by_page.get(page_num, []))
+            page_imgs_iter = iter(page_imgs)
+            # Fallback naming continues after pdfimages images on this page
+            fallback_n = len(page_imgs)
 
             for image_obj in page.images:
                 base64_str = image_obj.image_base64
@@ -235,15 +243,14 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
                     print(f"  Warning: Base64 decode error for {image_obj.id} on page {page_num}: {decode_err}")
                     continue
 
-                next_pymupdf = next(pymupdf_iter, None)
-                if next_pymupdf:
-                    # Use the high-res PyMuPDF version in place of the Mistral image
-                    page_image_mapping[image_obj.id] = next_pymupdf
+                next_img = next(page_imgs_iter, None)
+                if next_img:
+                    # Use the high-res pdfimages version in place of the Mistral image
+                    page_image_mapping[image_obj.id] = next_img
                 else:
-                    # No PyMuPDF match — use Mistral image as low-quality fallback
-                    print(f"  WARNING: Page {page_num}: Mistral found '{image_obj.id}' but PyMuPDF had no "
-                          f"match. Using Mistral version as fallback (lower quality). "
-                          f"Consider poppler pdfimages for more complete extraction.")
+                    # No pdfimages match — use Mistral image as low-quality fallback
+                    print(f"  WARNING: Page {page_num}: Mistral found '{image_obj.id}' but pdfimages had no "
+                          f"match. Using Mistral version as fallback (lower quality).")
                     fallback_n += 1
                     orig_ext = Path(image_obj.id).suffix or ".jpeg"
                     fallback_name = f"{pdf_base_sanitized}_p{page_num}_img{fallback_n}{orig_ext}"
@@ -256,17 +263,17 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
 
             updated_page_markdown = replace_images_in_markdown(current_page_markdown, page_image_mapping)
 
-            # Append any remaining PyMuPDF images not matched to a Mistral placement
-            extra_pymupdf = list(pymupdf_iter)
-            if extra_pymupdf:
-                img_refs = "\n".join(f"![](images/{name})" for name in extra_pymupdf)
+            # Append any remaining pdfimages images not matched to a Mistral placement
+            extra_imgs = list(page_imgs_iter)
+            if extra_imgs:
+                img_refs = "\n".join(f"![](images/{name})" for name in extra_imgs)
                 supplement = (
                     f"\n\n> [!note] Additional Extracted Images — Page {page_num}\n"
                     f"> The following images were found on this page but were not placed inline by OCR.\n\n"
                     f"{img_refs}"
                 )
                 updated_page_markdown += supplement
-                print(f"  Page {page_num}: appended {len(extra_pymupdf)} additional image(s) not placed by OCR.")
+                print(f"  Page {page_num}: appended {len(extra_imgs)} additional image(s) not placed by OCR.")
 
             updated_markdown_pages.append(updated_page_markdown)
 

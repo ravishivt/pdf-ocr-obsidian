@@ -10,7 +10,7 @@ You can also find useful the [OCR Extractor Plugin for Obsidian](https://obsidia
 
 - **Batch processing:** Place multiple PDFs in the input folder and process them automatically.
 - **Text extraction:** Converts scanned PDFs into structured markdown format while preserving document hierarchy.
-- **Image extraction:** Saves images separately and links them in the markdown using Obsidian-compatible `![[image-name]]` format.
+- **Image extraction:** Extracts full-resolution images via `pdfimages` (poppler) and links them in the markdown using standard `![](images/name)` format.
 - **Automatic organization:** Each processed PDF gets its own output folder with the markdown and images.
 - **OCR caching:** Saves the OCR response as JSON to avoid redundant API calls.
 - **Notebook mode:** Running step-by-step OCR processing in a Jupyter Notebook.
@@ -21,11 +21,27 @@ Contributions to improve compatibility and robustness are welcome!
 
 ![alt text](doc/usage.gif)
 
+### Prerequisites
+
+Install [poppler](https://poppler.freedesktop.org/) for full-resolution image extraction:
+
+```sh
+# macOS
+brew install poppler
+
+# Ubuntu/Debian
+sudo apt-get install poppler-utils
+```
+
+### Setup
+
 ```sh
 pip install -r requirements.txt    # (I recommend creating a virtual environment to not clutter your OS)
 python app.py
 ```
-Then open your browser at `http://localhost:5000/`
+Then open your browser at `http://localhost:5200/`
+
+Or use the provided `start.sh` (macOS) which handles venv activation, dependency install, and browser launch.
 
 ### Customizing Page Separators
 
@@ -37,10 +53,10 @@ The web interface also lets you toggle and edit the separator before processing.
 
 ### Installation
 
-Ensure you have Python 3.9+. Then install dependencies:
+Ensure you have Python 3.9+ and poppler installed (see [Prerequisites](#prerequisites) above). Then install dependencies:
 
 ```sh
-pip install mistralai jupyter python-dotenv
+pip install mistralai jupyter python-dotenv Pillow
 ```
 
 ### Usage
