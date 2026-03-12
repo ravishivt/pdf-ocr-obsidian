@@ -270,8 +270,16 @@ def process_pdf(pdf_path: Path, api_key: str, session_output_dir: Path, page_sep
 
             updated_markdown_pages.append(updated_page_markdown)
 
-        separator = f"\n\n{page_separator}\n\n" if page_separator else "\n\n"
-        final_markdown_content = separator.join(updated_markdown_pages)
+        parts = []
+        for i, page_markdown in enumerate(updated_markdown_pages):
+            parts.append(page_markdown)
+            if i < len(updated_markdown_pages) - 1:
+                next_page_num = i + 2
+                if page_separator:
+                    parts.append(f"\n\n{page_separator}\n*Page {next_page_num}*\n\n")
+                else:
+                    parts.append(f"\n\n*Page {next_page_num}*\n\n")
+        final_markdown_content = "".join(parts)
         output_markdown_path = pdf_output_dir / f"{pdf_base_sanitized}_output.md"
 
         try:
