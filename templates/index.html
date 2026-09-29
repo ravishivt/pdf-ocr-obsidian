@@ -37,6 +37,24 @@
             </select>
           </div>
 
+          {% if claude_accounts %}
+          <div class="form-group" id="account-group" style="display: none;">
+            <label for="account">Claude Code account</label>
+            <select id="account" name="account">
+              {% for config_dir, email in claude_accounts.items() %}
+              <option value="{{ config_dir }}" {% if config_dir == default_claude_account %}selected{% endif %}>{{ email }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          {% endif %}
+
+          <div class="form-group" id="cli-settings-group" style="display: none;">
+            <label for="model">Model</label>
+            <select id="model" name="model"></select>
+            <label for="effort" style="margin-top: 10px;">Effort</label>
+            <select id="effort" name="effort"></select>
+          </div>
+
           <div class="form-group" id="api-key-group">
             <label for="api-key"><span class="engine-label">Mistral API</span> key</label>
             <div class="password-toggle-group">
@@ -110,6 +128,7 @@
     </footer>
   </div>
   
+  <script>window.CLI_OPTIONS = {{ cli_options|tojson }};</script>
   <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

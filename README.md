@@ -6,7 +6,7 @@ Converts PDFs (datasheets, app notes, drawings) to Markdown with figures cropped
 
 - **Multiple engines:** Claude Code or Antigravity (both run on your logged-in subscription), the Gemini API, or Mistral OCR.
 - **Figures at source definition:** figures, including vector plots and schematics, are cropped from a page render at `max(FIGURE_DPI, highest embedded image ppi on the page)`. Boxes over embedded raster images snap to the image's exact placement in the PDF; other boxes are fitted to the surrounding ink so labels aren't clipped and neighboring text, figures, and table rules stay out.
-- **Page cache:** transcribed pages are cached in `.cache/pages/`, so re-running a PDF only requests pages that failed.
+- **Page cache:** transcribed pages are cached in `.cache/pages/` per engine, model, and effort, so re-running a PDF only requests pages that failed.
 - **Batch upload, page separators with page numbers, ZIP download, and in-browser preview.**
 
 ## Self-hosted Local Web App
@@ -37,9 +37,9 @@ Or use the provided `start.sh` (macOS) which handles venv activation, dependency
 
 ### OCR Engines
 
-Pick the engine in the web UI.
+Pick the engine in the web UI. For the CLI engines you can also pick the model and effort; `CLI setting` leaves effort to the CLI's own configuration.
 
-- **Claude Code** (default): runs `claude -p` on page chunks using your logged-in Claude subscription. Needs the `claude` CLI, logged in.
+- **Claude Code** (default): runs `claude -p` on page chunks using your logged-in Claude subscription. Needs the `claude` CLI, logged in. With several accounts, each logged in to its own config dir (`~/.claude-<name>`, used via `CLAUDE_CONFIG_DIR`), pick the account in the UI.
 - **Antigravity**: runs `agy -p` using your logged-in Google AI subscription (`agy models` lists the models). Needs the `agy` CLI, logged in.
 - **Gemini API** (`GEMINI_API_KEY`, [AI Studio](https://aistudio.google.com/apikey)): the free tier allows about 20 requests/day per model and often returns 503s, so it falls back through a chain of models.
 - **Mistral** (`MISTRAL_API_KEY`): Mistral OCR for text, `pdfimages` for embedded raster images.
@@ -51,7 +51,8 @@ Settings (environment variables, optional):
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OCR_ENGINE` | `claude-code` | Engine selected by default in the UI |
-| `CLAUDE_CODE_MODEL` / `ANTIGRAVITY_MODEL` | `opus` / `gemini-3.1-pro-high` | Model used by each CLI |
+| `CLAUDE_CODE_MODEL` / `ANTIGRAVITY_MODEL` | `opus` / newest `gemini-*-flash-high` | Model selected by default in the UI |
+| `CLAUDE_CODE_EFFORT` / `ANTIGRAVITY_EFFORT` | unset (CLI setting) | Effort selected by default in the UI |
 | `CLI_PAGES_PER_REQUEST` / `CLI_CONCURRENCY` | `5` / `3` | Pages per CLI run, and how many CLI runs happen in parallel |
 | `GEMINI_MODEL` | `gemini-3.6-flash,...,gemini-3.1-flash-lite` | Comma-separated fallback chain |
 | `GEMINI_PAGES_PER_REQUEST` / `GEMINI_CONCURRENCY` | `10` / `3` | Pages per request, and parallel requests |

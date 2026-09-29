@@ -18,6 +18,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Engine selection
     const engineSelect = document.getElementById('engine');
+    const accountGroup = document.getElementById('account-group');  // absent when no Claude login is found
+    const accountSelect = document.getElementById('account');
+    // Model and effort choices for the CLI engines (from the server: {engine: {models, model, efforts, effort}})
+    const cliSettingsGroup = document.getElementById('cli-settings-group');
+    const modelSelect = document.getElementById('model');
+    const effortSelect = document.getElementById('effort');
+    function fillSelect(select, options, selected) {
+        select.replaceChildren(...options.map(([value, label]) => new Option(label, value, false, value === selected)));
+    }
     function selectedEngine() {
         return engineSelect.value;
     }
@@ -25,6 +34,15 @@ document.addEventListener('DOMContentLoaded', () => {
         const option = engineSelect.selectedOptions[0];
         document.querySelectorAll('.engine-label').forEach(el => { el.textContent = option.textContent; });
         apiKeyLink.href = option.dataset.keyUrl;
+        if (accountGroup) {
+            accountGroup.style.display = selectedEngine() === 'claude-code' ? 'block' : 'none';
+        }
+        const cli = window.CLI_OPTIONS[selectedEngine()];
+        cliSettingsGroup.style.display = cli ? 'block' : 'none';
+        if (cli) {
+            fillSelect(modelSelect, cli.models, cli.model);
+            fillSelect(effortSelect, cli.efforts, cli.effort);
+        }
     }
     engineSelect.addEventListener('change', () => {
         updateEngineLabels();
@@ -266,6 +284,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const formData = new FormData();
         formData.append('engine', selectedEngine());
+        if (accountSelect && selectedEngine() === 'claude-code') {
+            formData.append('account', accountSelect.value);
+        }
+        if (window.CLI_OPTIONS[selectedEngine()]) {
+            formData.append('model', modelSelect.value);
+            formData.append('effort', effortSelect.value);
+        }
         // Only append API key if user provided one (environment key will be used automatically)
         if (apiKey) {
             formData.append('api_key', apiKey);

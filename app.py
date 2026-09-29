@@ -2,6 +2,7 @@ import os
 import io
 import json
 import base64
+import functools
 import hashlib
 import httpx
 import math
@@ -13,6 +14,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 from flask import Flask, request, render_template, jsonify, send_from_directory, url_for
@@ -46,8 +48,17 @@ ENGINES = {
 DEFAULT_ENGINE = os.getenv('OCR_ENGINE', 'claude-code')
 
 # Agent CLI engines (claude / agy print mode). Each request runs one agent session on a page chunk.
-CLAUDE_CODE_MODEL = os.getenv('CLAUDE_CODE_MODEL', 'opus')
-ANTIGRAVITY_MODEL = os.getenv('ANTIGRAVITY_MODEL', 'gemini-3.1-pro-high')
+# Models and --effort levels offered in the UI; model/effort are the defaults (effort '' = the CLI's own
+# setting, model '' = the newest Gemini Flash at high thinking). Antigravity's models are listed by
+# `agy models` (see antigravity_models).
+CLI_ENGINES = {
+    'claude-code': {'model': os.getenv('CLAUDE_CODE_MODEL', 'opus'), 'effort': os.getenv('CLAUDE_CODE_EFFORT', ''),
+                    'models': [('opus', 'Opus'), ('fable', 'Fable'), ('sonnet', 'Sonnet'), ('haiku', 'Haiku')],
+                    'efforts': ['low', 'medium', 'high', 'xhigh', 'max']},
+    'antigravity': {'model': os.getenv('ANTIGRAVITY_MODEL', ''),
+                    'effort': os.getenv('ANTIGRAVITY_EFFORT', ''),
+                    'models': lambda: antigravity_models(), 'efforts': ['low', 'medium', 'high', 'max']},
+}
 CLI_PAGES_PER_REQUEST = int(os.getenv('CLI_PAGES_PER_REQUEST', 5))
 CLI_CONCURRENCY = int(os.getenv('CLI_CONCURRENCY', 3))
 CLI_TIMEOUT_S = 900
@@ -332,12 +343,13 @@ class GeminiModelChain:
         raise RuntimeError(f"All Gemini models are unavailable: {', '.join(self.models)}")
 
 
-def page_cache_path(cache_dir: Path, engine: str, page_num: int) -> Path:
-    return cache_dir / f"{engine}_{PROMPT_HASH}_p{page_num}.md"
+def page_cache_path(cache_dir: Path, cache_key: str, page_num: int) -> Path:
+    """Cached page for an engine setup (cache_key: engine, plus model and effort for the CLI engines)."""
+    return cache_dir / f"{cache_key}_{PROMPT_HASH}_p{page_num}.md"
 
 
 def transcribe_range(transcriber, engine: str, pdf_bytes: bytes, first: int, last: int, page_count: int,
-                     raw_log: list, cache_dir: Path) -> dict[int, str]:
+                     raw_log: list, cache_dir: Path, cache_key: str) -> dict[int, str]:
     """
     Transcribe pages first..last with `transcriber(chunk_pdf_bytes, prompt) -> (text, finish_reason, model)`.
     Splits the range in half and retries if output comes back incomplete. Complete pages are written to
@@ -358,14 +370,14 @@ def transcribe_range(transcriber, engine: str, pdf_bytes: bytes, first: int, las
         print(f"  {label}: pages {first}-{last} incomplete (finish={finish}, missing={missing}); retrying in halves.")
         mid = (first + last) // 2
         return {
-            **transcribe_range(transcriber, engine, pdf_bytes, first, mid, page_count, raw_log, cache_dir),
-            **transcribe_range(transcriber, engine, pdf_bytes, mid + 1, last, page_count, raw_log, cache_dir),
+            **transcribe_range(transcriber, engine, pdf_bytes, first, mid, page_count, raw_log, cache_dir, cache_key),
+            **transcribe_range(transcriber, engine, pdf_bytes, mid + 1, last, page_count, raw_log, cache_dir, cache_key),
         }
     if missing or finish not in ('STOP', 'UNKNOWN'):
         print(f"  WARNING: {label} page {first} finished with {finish}; output may be incomplete.")
     else:
         for page_num, markdown in pages.items():
-            page_cache_path(cache_dir, engine, page_num).write_text(markdown, encoding='utf-8')
+            page_cache_path(cache_dir, cache_key, page_num).write_text(markdown, encoding='utf-8')
     return pages
 
 
@@ -391,14 +403,42 @@ def gemini_api_transcriber(api_key: str):
     return transcribe
 
 
-def run_cli(cmd: list[str], chunk: bytes) -> str:
+def claude_accounts() -> dict[str, str]:
+    """
+    Logged-in Claude Code accounts, as {config dir: email}. Each account is a CLAUDE_CONFIG_DIR
+    (~/.claude, ~/.claude-*, or the one this app was started with) holding its own login.
+    """
+    dirs = {Path.home() / '.claude', *Path.home().glob('.claude-*')}
+    if os.getenv('CLAUDE_CONFIG_DIR'):
+        dirs.add(Path(os.environ['CLAUDE_CONFIG_DIR']).expanduser())
+    accounts = {}
+    for config_dir in sorted(d for d in dirs if d.is_dir()):
+        state = config_dir / '.claude.json'
+        if not state.exists() and config_dir == Path.home() / '.claude':
+            state = Path.home() / '.claude.json'  # default location when CLAUDE_CONFIG_DIR is unset
+        try:
+            email = (json.loads(state.read_text()).get('oauthAccount') or {}).get('emailAddress')
+        except (OSError, ValueError):
+            continue
+        if email:
+            accounts[str(config_dir)] = email
+    return accounts
+
+
+def default_claude_account(accounts: dict[str, str]) -> str | None:
+    """The account the app's own environment points at, else the first logged-in one."""
+    current = str(Path(os.getenv('CLAUDE_CONFIG_DIR', '~/.claude')).expanduser())
+    return current if current in accounts else next(iter(accounts), None)
+
+
+def run_cli(cmd: list[str], chunk: bytes, env: dict[str, str] | None = None) -> str:
     """Run an agent CLI in a temp dir containing chunk.pdf; return stdout."""
     if not shutil.which(cmd[0]):
         raise RuntimeError(f"'{cmd[0]}' CLI not found on PATH. Install it and log in first.")
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / 'chunk.pdf').write_bytes(chunk)
         try:
-            result = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+            result = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=CLI_TIMEOUT_S, env=env)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{cmd[0]} timed out after {CLI_TIMEOUT_S}s")
     if result.returncode != 0:
@@ -407,29 +447,80 @@ def run_cli(cmd: list[str], chunk: bytes) -> str:
     return result.stdout
 
 
-def claude_code_transcriber():
-    """Transcriber using Claude Code headless mode (`claude -p`); runs on the logged-in Claude subscription."""
+@dataclass(frozen=True)
+class CliSettings:
+    """What a CLI engine run uses: model, --effort ('' = the CLI's own setting), and for Claude Code the
+    account's config dir (None = the app's own CLAUDE_CONFIG_DIR)."""
+    model: str
+    effort: str = ''
+    account: str | None = None
+
+
+@functools.cache
+def antigravity_models() -> list[tuple[str, str]]:
+    """(id, label) of the models `agy models` offers, e.g. ('gemini-3.1-pro-high', 'Gemini 3.1 Pro (High)')."""
+    try:
+        out = subprocess.run(['agy', 'models'], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ''
+    return [tuple(line.split('\t', 1)) for line in out.splitlines() if '\t' in line]
+
+
+def default_cli_model(engine: str) -> str:
+    """The engine's default model; for Antigravity without one configured, the newest Gemini Flash (High)."""
+    if CLI_ENGINES[engine]['model']:
+        return CLI_ENGINES[engine]['model']
+    flash = [(tuple(int(n) for n in m.group(1).split('.')), model) for model, _ in antigravity_models()
+             if (m := re.fullmatch(r'gemini-(\d+(?:\.\d+)*)-flash-high', model))]
+    return max(flash)[1] if flash else 'gemini-3.8-flash-high'
+
+
+def cli_engine_options() -> dict[str, dict]:
+    """Per CLI engine: the models ([id, label]) and efforts offered in the UI, and the defaults."""
+    options = {}
+    for engine, cfg in CLI_ENGINES.items():
+        models = cfg['models']() if callable(cfg['models']) else cfg['models']
+        default_model = default_cli_model(engine)
+        if default_model not in (m for m, _ in models):
+            models = [(default_model, default_model), *models]
+        options[engine] = {'models': models, 'model': default_model,
+                           'efforts': [('', 'CLI setting'), *((e, e) for e in cfg['efforts'])], 'effort': cfg['effort']}
+    return options
+
+
+def claude_code_transcriber(cli: CliSettings):
+    """Transcriber using Claude Code headless mode (`claude -p`); runs on the Claude subscription logged in
+    to cli.account (see claude_accounts)."""
+    env = None
+    if cli.account:
+        env = {k: v for k, v in os.environ.items() if k != 'CLAUDE_CONFIG_DIR'}
+        if (Path(cli.account) / '.claude.json').exists():  # otherwise it's the default ~/.claude: leave unset
+            env['CLAUDE_CONFIG_DIR'] = cli.account
+    effort = ['--effort', cli.effort] if cli.effort else []
+
     def transcribe(chunk: bytes, prompt: str) -> tuple[str, str, str]:
-        out = run_cli(['claude', '-p', prompt + CLI_PROMPT_SUFFIX, '--model', CLAUDE_CODE_MODEL,
-                       '--tools', 'Read', '--allowedTools', 'Read', '--output-format', 'json'], chunk)
+        out = run_cli(['claude', '-p', prompt + CLI_PROMPT_SUFFIX, '--model', cli.model, *effort,
+                       '--tools', 'Read', '--allowedTools', 'Read', '--output-format', 'json'], chunk, env)
         data = json.loads(out)
         if data.get('is_error'):
             raise RuntimeError(f"Claude Code error: {str(data.get('result'))[:300]}")
         finish = 'MAX_TOKENS' if data.get('stop_reason') == 'max_tokens' else 'STOP'
-        model = ','.join((data.get('modelUsage') or {}).keys()) or CLAUDE_CODE_MODEL
+        model = ','.join((data.get('modelUsage') or {}).keys()) or cli.model
         return data.get('result') or '', finish, model
     return transcribe
 
 
-def antigravity_transcriber():
+def antigravity_transcriber(cli: CliSettings):
     """Transcriber using Antigravity CLI print mode (`agy -p`); runs on the logged-in Google AI subscription."""
+    effort = ['--effort', cli.effort] if cli.effort else []
+
     def transcribe(chunk: bytes, prompt: str) -> tuple[str, str, str]:
-        out = run_cli(['agy', '-p', prompt + CLI_PROMPT_SUFFIX, '--model', ANTIGRAVITY_MODEL, '--add-dir', '.',
+        out = run_cli(['agy', '-p', prompt + CLI_PROMPT_SUFFIX, '--model', cli.model, *effort, '--add-dir', '.',
                        '--output-format', 'json', '--print-timeout', f"{CLI_TIMEOUT_S}s"], chunk)
         data = json.loads(out)
         if data.get('status') != 'SUCCESS':
             raise RuntimeError(f"Antigravity status {data.get('status')}: {str(data.get('response'))[:300]}")
-        return data.get('response') or '', 'STOP', ANTIGRAVITY_MODEL
+        return data.get('response') or '', 'STOP', cli.model
     return transcribe
 
 
@@ -672,10 +763,10 @@ def crop_figures(markdown: str, page_num: int, pdf_path: Path, images_dir: Path,
 
 
 def ocr_with_llm(engine: str, pdf_path: Path, api_key: str | None, pdf_output_dir: Path, images_dir: Path,
-                 pdf_base_sanitized: str) -> tuple[list[str], list[str], list[str]]:
+                 pdf_base_sanitized: str, cli: CliSettings | None = None) -> tuple[list[str], list[str], list[str]]:
     """
     Transcribe a PDF with a multimodal LLM engine (Gemini API, Claude Code, or Antigravity), in parallel
-    chunks of pages.
+    chunks of pages. cli sets model, effort, and account for the CLI engines (their defaults if None).
 
     The model reads the PDF natively (text layer + page images) and marks each figure with a bounding
     box; figures are cropped from a page render (snapped to embedded images where present), so vector
@@ -693,11 +784,16 @@ def ocr_with_llm(engine: str, pdf_path: Path, api_key: str | None, pdf_output_di
         raise RuntimeError("Could not determine page count.")
     pdf_bytes = pdf_path.read_bytes()
 
+    if engine in CLI_ENGINES:
+        cli = cli or CliSettings(default_cli_model(engine), CLI_ENGINES[engine]['effort'])
+        print(f"  {label}: model {cli.model}, effort {cli.effort or 'CLI setting'}.")
+    # Pages are cached per engine setup: another model or effort gives different output
+    cache_key = f"{engine}_{cli.model}_{cli.effort or 'default'}" if engine in CLI_ENGINES else engine
     cache_dir = PAGE_CACHE_FOLDER / hashlib.sha256(pdf_bytes).hexdigest()[:16]
     cache_dir.mkdir(parents=True, exist_ok=True)
     pages: dict[int, str] = {}
     for page_num in range(1, page_count + 1):
-        cached = page_cache_path(cache_dir, engine, page_num)
+        cached = page_cache_path(cache_dir, cache_key, page_num)
         if cached.exists():
             pages[page_num] = cached.read_text(encoding='utf-8')
     if pages:
@@ -706,9 +802,9 @@ def ocr_with_llm(engine: str, pdf_path: Path, api_key: str | None, pdf_output_di
     if engine == 'gemini':
         transcriber, pages_per_request, concurrency = gemini_api_transcriber(api_key), GEMINI_PAGES_PER_REQUEST, GEMINI_CONCURRENCY
     elif engine == 'claude-code':
-        transcriber, pages_per_request, concurrency = claude_code_transcriber(), CLI_PAGES_PER_REQUEST, CLI_CONCURRENCY
+        transcriber, pages_per_request, concurrency = claude_code_transcriber(cli), CLI_PAGES_PER_REQUEST, CLI_CONCURRENCY
     else:
-        transcriber, pages_per_request, concurrency = antigravity_transcriber(), CLI_PAGES_PER_REQUEST, CLI_CONCURRENCY
+        transcriber, pages_per_request, concurrency = antigravity_transcriber(cli), CLI_PAGES_PER_REQUEST, CLI_CONCURRENCY
 
     ranges = page_chunks([p for p in range(1, page_count + 1) if p not in pages], pages_per_request)
     print(f"  {label}: {page_count - len(pages)} pages in {len(ranges)} request(s)...")
@@ -717,7 +813,8 @@ def ocr_with_llm(engine: str, pdf_path: Path, api_key: str | None, pdf_output_di
     failures: list[str] = []
     executor = ThreadPoolExecutor(max_workers=concurrency)
     try:
-        futures = {executor.submit(transcribe_range, transcriber, engine, pdf_bytes, s, e, page_count, raw_log, cache_dir): (s, e)
+        futures = {executor.submit(transcribe_range, transcriber, engine, pdf_bytes, s, e, page_count, raw_log,
+                                   cache_dir, cache_key): (s, e)
                    for s, e in ranges}
         for future, (first, last) in futures.items():
             try:
@@ -917,7 +1014,7 @@ def ocr_with_mistral(pdf_path: Path, api_key: str, pdf_output_dir: Path, images_
 # --- Core Processing Logic ---
 
 def process_pdf(pdf_path: Path, engine: str, api_key: str, session_output_dir: Path,
-                page_separator: str | None = PAGE_SEPARATOR_DEFAULT) -> tuple[str, str, list[str], Path, Path, list[str]]:
+                page_separator: str | None = PAGE_SEPARATOR_DEFAULT, cli: CliSettings | None = None) -> tuple[str, str, list[str], Path, Path, list[str]]:
     """
     Processes a single PDF file with the given OCR engine and saves the markdown + images.
 
@@ -944,7 +1041,8 @@ def process_pdf(pdf_path: Path, engine: str, api_key: str, session_output_dir: P
         if engine == 'mistral':
             page_markdowns, image_filenames, warnings = ocr_with_mistral(pdf_path, api_key, pdf_output_dir, images_dir, pdf_base_sanitized)
         else:
-            page_markdowns, image_filenames, warnings = ocr_with_llm(engine, pdf_path, api_key, pdf_output_dir, images_dir, pdf_base_sanitized)
+            page_markdowns, image_filenames, warnings = ocr_with_llm(engine, pdf_path, api_key, pdf_output_dir, images_dir, pdf_base_sanitized,
+                                                                     cli)
     except genai_errors.APIError as e:
         print(f"  Error processing {pdf_path.name}: {e}")
         raise Exception(f"Gemini API error {e.code}: {e.message}") from e
@@ -988,8 +1086,11 @@ def create_zip_archive(source_dir: Path, output_zip_path: Path):
 
 @app.route('/')
 def index():
+    accounts = claude_accounts()
     return render_template('index.html', default_page_separator=PAGE_SEPARATOR_DEFAULT,
-                           engines=ENGINES, default_engine=DEFAULT_ENGINE)
+                           engines=ENGINES, default_engine=DEFAULT_ENGINE,
+                           claude_accounts=accounts, default_claude_account=default_claude_account(accounts),
+                           cli_options=cli_engine_options())
 
 @app.route('/check-api-key', methods=['GET'])
 def check_api_key():
@@ -1045,6 +1146,22 @@ def handle_process():
             return jsonify({"error": f"{engine_cfg['label']} key is required. Set {engine_cfg['key_env']} in .env "
                                      f"or provide it in the form (get one at {engine_cfg['key_url']})."}), 400
 
+    cli = None
+    if engine in CLI_ENGINES:
+        options = cli_engine_options()[engine]
+        model = request.form.get('model', options['model'])
+        effort = request.form.get('effort', options['effort'])
+        if model not in (m for m, _ in options['models']) or effort not in (e for e, _ in options['efforts']):
+            return jsonify({"error": f"Unsupported {engine_cfg['label']} model or effort: {model}, {effort}"}), 400
+        account = None
+        if engine == 'claude-code':
+            accounts = claude_accounts()
+            account = request.form.get('account') or default_claude_account(accounts)
+            if account and account not in accounts:
+                return jsonify({"error": f"Unknown Claude Code account: {account}"}), 400
+            print(f"Using Claude Code account {accounts.get(account, 'from the environment')}.")
+        cli = CliSettings(model, effort, account)
+
     if not files or all(f.filename == '' for f in files):
         return jsonify({"error": "No selected PDF files"}), 400
 
@@ -1086,7 +1203,7 @@ def handle_process():
             file.save(temp_pdf_path)
 
             processed_pdf_base, markdown_content, image_filenames, md_path, img_dir, warnings = process_pdf(
-                temp_pdf_path, engine, api_key, session_output_dir, page_separator
+                temp_pdf_path, engine, api_key, session_output_dir, page_separator, cli
             )
 
             zip_filename = f"{processed_pdf_base}_output.zip"
@@ -1179,4 +1296,5 @@ if __name__ == '__main__':
     port = int(os.getenv('FLASK_PORT', 5200))
     debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() in ['true', '1', 't']
 
+    threading.Thread(target=antigravity_models, daemon=True).start()  # `agy models` takes a few seconds
     app.run(host=host, port=port, debug=debug_mode)
