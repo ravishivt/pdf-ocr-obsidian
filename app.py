@@ -221,7 +221,8 @@ GEMINI_CONFIG = genai_types.GenerateContentConfig(
 
 # Agent CLIs get the page chunk as a file rather than inline
 CLI_PROMPT_SUFFIX = ("\n\nThe PDF is the file chunk.pdf in the current directory. Read all of its pages "
-                     "(including the page images), then reply with ONLY the transcription in the format above: "
+                     "(including the page images) with your file-reading tool; don't run shell commands, they are "
+                     "not permitted. Then reply with ONLY the transcription in the format above: "
                      "no preamble, no summary, no commentary.")
 
 # Cached pages are only reused when the prompt they were produced with is unchanged
@@ -520,7 +521,11 @@ def antigravity_transcriber(cli: CliSettings):
         data = json.loads(out)
         if data.get('status') != 'SUCCESS':
             raise RuntimeError(f"Antigravity status {data.get('status')}: {str(data.get('response'))[:300]}")
-        return data.get('response') or '', 'STOP', cli.model
+        if not data.get('response'):
+            # Typically the model tried a tool that print mode auto-denies (e.g. a shell command)
+            denied = ', '.join(a.get('display_name', a.get('action', '?')) for a in data.get('denied_actions') or [])
+            raise RuntimeError(f"Antigravity returned no output{f' (denied: {denied})' if denied else ''}")
+        return data['response'], 'STOP', cli.model
     return transcribe
 
 
