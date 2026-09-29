@@ -14,6 +14,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // API Key elements
     const apiKeyGroup = document.getElementById('api-key-group');
     const apiKeyConfigured = document.getElementById('api-key-configured');
+    const apiKeyLink = document.getElementById('api-key-link');
+
+    // Engine selection
+    const engineSelect = document.getElementById('engine');
+    function selectedEngine() {
+        return engineSelect.value;
+    }
+    function updateEngineLabels() {
+        const option = engineSelect.selectedOptions[0];
+        document.querySelectorAll('.engine-label').forEach(el => { el.textContent = option.textContent; });
+        apiKeyLink.href = option.dataset.keyUrl;
+    }
+    engineSelect.addEventListener('change', () => {
+        updateEngineLabels();
+        checkApiKey();
+    });
+    updateEngineLabels();
 
     // Result Areas
     const resultsArea = document.getElementById('results-area');
@@ -30,11 +47,18 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch('/check-api-key');
             const result = await response.json();
-            if (result.has_api_key) {
+            const status = result[selectedEngine()] || {};
+            const engineLabel = engineSelect.selectedOptions[0].textContent;
+            if (!status.needs_key) {
+                // CLI engine: runs on the logged-in subscription, no key needed
+                apiKeyGroup.style.display = 'none';
+                apiKeyConfigured.style.display = 'none';
+                logStatus(`${engineLabel}: uses your logged-in CLI, no API key needed.`);
+            } else if (status.has_key) {
                 // Hide API key input, show configured message
                 apiKeyGroup.style.display = 'none';
                 apiKeyConfigured.style.display = 'block';
-                logStatus('API Key loaded from environment variables.');
+                logStatus(`${engineLabel} key loaded from environment variables.`);
             } else {
                 // Show API key input
                 apiKeyGroup.style.display = 'block';
@@ -69,7 +93,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const resp = await fetch('/save-api-key', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_key: key })
+                    body: JSON.stringify({ api_key: key, engine: selectedEngine() })
                 });
                 const data = await resp.json();
                 if (data.success) {
@@ -241,6 +265,7 @@ document.addEventListener('DOMContentLoaded', () => {
         logStatus('Starting PDF processing...');
 
         const formData = new FormData();
+        formData.append('engine', selectedEngine());
         // Only append API key if user provided one (environment key will be used automatically)
         if (apiKey) {
             formData.append('api_key', apiKey);

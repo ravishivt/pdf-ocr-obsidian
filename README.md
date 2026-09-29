@@ -1,21 +1,13 @@
-# PDF OCR Pipeline to Markdown using Mistral AI
+# PDF to Markdown for Obsidian
 
-This is a workflow to automate the conversion of PDFs to markdown using the Mistral AI OCR API. It extracts text and images from PDFs and organizes the output into structured markdown documents with images properly linked using Obsidian-style wikilinks.
-
-The initial version was a [Jupyter Notebook](#option-3-jupyter-notebook). Recently, I vibe-coded a [Local Web App](#option-1-self-hosted-local-web-app) where you can do the same in a more visual and understandable way, might have some defects and problems, feel free to improve it or host it online for others.
-
-You can also find useful the [OCR Extractor Plugin for Obsidian](https://obsidian.md/plugins?id=ocr-extractor), made by jritzi ([GitHub](https://github.com/jritzi/ocr-extractor)). Which uses the same Mistral OCR technology.
+Converts PDFs (datasheets, app notes, drawings) to Markdown with figures cropped as images and linked with standard `![](images/name.png)` links. A local Flask web app does the conversion. An older Mistral-only [Jupyter Notebook](#jupyter-notebook) is also included.
 
 ## Features
 
-- **Batch processing:** Place multiple PDFs in the input folder and process them automatically.
-- **Text extraction:** Converts scanned PDFs into structured markdown format while preserving document hierarchy.
-- **Image extraction:** Extracts full-resolution images via `pdfimages` (poppler) and links them in the markdown using standard `![](images/name)` format.
-- **Automatic organization:** Each processed PDF gets its own output folder with the markdown and images.
-- **OCR caching:** Saves the OCR response as JSON to avoid redundant API calls.
-- **Notebook mode:** Running step-by-step OCR processing in a Jupyter Notebook.
-
-Contributions to improve compatibility and robustness are welcome!
+- **Multiple engines:** Claude Code or Antigravity (both run on your logged-in subscription), the Gemini API, or Mistral OCR.
+- **Figures at source definition:** figures, including vector plots and schematics, are cropped from a page render at `max(FIGURE_DPI, highest embedded image ppi on the page)`. Boxes over embedded raster images snap to the image's exact placement in the PDF; other boxes are fitted to the surrounding ink so labels aren't clipped and neighboring text, figures, and table rules stay out.
+- **Page cache:** transcribed pages are cached in `.cache/pages/`, so re-running a PDF only requests pages that failed.
+- **Batch upload, page separators with page numbers, ZIP download, and in-browser preview.**
 
 ## Self-hosted Local Web App
 
@@ -23,7 +15,7 @@ Contributions to improve compatibility and robustness are welcome!
 
 ### Prerequisites
 
-Install [poppler](https://poppler.freedesktop.org/) for full-resolution image extraction:
+Install [poppler](https://poppler.freedesktop.org/), which is used to render pages and crop figures:
 
 ```sh
 # macOS
@@ -42,6 +34,28 @@ python app.py
 Then open your browser at `http://localhost:5200/`
 
 Or use the provided `start.sh` (macOS) which handles venv activation, dependency install, and browser launch.
+
+### OCR Engines
+
+Pick the engine in the web UI.
+
+- **Claude Code** (default): runs `claude -p` on page chunks using your logged-in Claude subscription. Needs the `claude` CLI, logged in.
+- **Antigravity**: runs `agy -p` using your logged-in Google AI subscription (`agy models` lists the models). Needs the `agy` CLI, logged in.
+- **Gemini API** (`GEMINI_API_KEY`, [AI Studio](https://aistudio.google.com/apikey)): the free tier allows about 20 requests/day per model and often returns 503s, so it falls back through a chain of models.
+- **Mistral** (`MISTRAL_API_KEY`): Mistral OCR for text, `pdfimages` for embedded raster images.
+
+The LLM engines all share one prompt. The model returns Markdown per page, starting each page with a `<<<PAGE n>>>` marker, and puts `![desc](box:ymin,xmin,ymax,xmax)` placeholders where figures go. Raw responses are saved to `llm_response.json`. To check that text came through completely, run `python tools/check_text_coverage.py <file.pdf> <output.md>`.
+
+Settings (environment variables, optional):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OCR_ENGINE` | `claude-code` | Engine selected by default in the UI |
+| `CLAUDE_CODE_MODEL` / `ANTIGRAVITY_MODEL` | `opus` / `gemini-3.1-pro-high` | Model used by each CLI |
+| `CLI_PAGES_PER_REQUEST` / `CLI_CONCURRENCY` | `5` / `3` | Pages per CLI run, and how many CLI runs happen in parallel |
+| `GEMINI_MODEL` | `gemini-3.6-flash,...,gemini-3.1-flash-lite` | Comma-separated fallback chain |
+| `GEMINI_PAGES_PER_REQUEST` / `GEMINI_CONCURRENCY` | `10` / `3` | Pages per request, and parallel requests |
+| `FIGURE_DPI` | `300` | Minimum render DPI for cropped figures |
 
 ### Customizing Page Separators
 

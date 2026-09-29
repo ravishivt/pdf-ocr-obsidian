@@ -22,14 +22,23 @@
   <div class="container">
     <header>
       <h1>PDF to Markdown OCR</h1>
-      <p class="tagline">Convert your PDFs effortlessly using Mistral AI OCR</p>
+      <p class="tagline">Convert your PDFs using Claude, Gemini, or Mistral</p>
     </header>
-    
+
     <main>
       <section class="form-section">
         <form id="ocr-form">
+          <div class="form-group">
+            <label for="engine">OCR Engine</label>
+            <select id="engine" name="engine">
+              {% for name, cfg in engines.items() %}
+              <option value="{{ name }}" data-key-url="{{ cfg.key_url or '' }}" {% if name == default_engine %}selected{% endif %}>{{ cfg.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
           <div class="form-group" id="api-key-group">
-            <label for="api-key">Mistral API Key</label>
+            <label for="api-key"><span class="engine-label">Mistral API</span> key</label>
             <div class="password-toggle-group">
               <input type="password" id="api-key" name="api_key" placeholder="Enter your API key">
               <input type="checkbox" id="api-key-toggle">
@@ -39,14 +48,14 @@
               <button type="button" id="save-api-key-btn" class="btn-secondary">Save key to .env</button>
               <small id="save-api-key-status" style="margin-left: 8px;"></small>
             </div>
-            <small>Get one at: <a href="https://console.mistral.ai/api-keys" target="_blank">Mistral API</a></small>
+            <small>Get one at: <a id="api-key-link" href="https://console.mistral.ai/api-keys" target="_blank"><span class="engine-label">Mistral API</span></a></small>
             <small>Saving stores the key in a local <code>.env</code> file (not committed to git).</small>
           </div>
           
           <div class="form-group" id="api-key-configured" style="display: none;">
             <div class="api-key-status">
               <i class="fas fa-check-circle" style="color: green;"></i>
-              <span>API Key has been loaded from environment variables</span>
+              <span><span class="engine-label">Mistral API</span> key has been loaded from environment variables</span>
             </div>
           </div>
           
@@ -70,7 +79,8 @@
       
       <section id="status-area" class="status-section">
         <h2>Processing Status</h2>
-        <pre id="status-log">Ready. Select files and click "Convert PDFs".</pre>
+        <pre id="status-log">Ready. Select files and click "Convert PDFs".
+</pre>
         <div class="loader" id="loader" style="display: none;"></div>
       </section>
       
